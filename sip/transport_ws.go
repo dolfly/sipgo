@@ -29,6 +29,16 @@ type TransportWS struct {
 	transport  string
 	readFilter TransportReadFilter
 
+	// ReadTimeout limits how long a WS or WSS connection may block waiting for
+	// a frame. It is copied when the connection is created. A non-positive
+	// value disables the timeout.
+	ReadTimeout time.Duration
+
+	// WriteTimeout limits how long a WS or WSS connection may block writing a
+	// frame. It is copied when the connection is created. A non-positive value
+	// disables the timeout.
+	WriteTimeout time.Duration
+
 	connectionReuse bool
 
 	pool   *connectionPool
@@ -41,6 +51,16 @@ type TransportWS struct {
 	DialURI func(host string) string
 
 	onConnClose func(conn Connection)
+}
+
+func (t *TransportWS) newConnection(conn net.Conn, refcount int, clientSide bool) *WSConnection {
+	return &WSConnection{
+		Conn:         conn,
+		clientSide:   clientSide,
+		readTimeout:  t.ReadTimeout,
+		writeTimeout: t.WriteTimeout,
+		refcount:     refcount,
+	}
 }
 
 func newWSTransport(par *Parser) *TransportWS {
@@ -157,11 +177,7 @@ func (t *TransportWS) initConnection(conn net.Conn, raddr string, clientSide boo
 	// conn.SetKeepAlivePeriod(3 * time.Second)
 	laddr := conn.LocalAddr().String()
 	t.log.Debug("New WS connection", "raddr", raddr)
-	c := &WSConnection{
-		Conn:       conn,
-		refcount:   1 + TransportIdleConnection,
-		clientSide: clientSide,
-	}
+	c := t.newConnection(conn, 1+TransportIdleConnection, clientSide)
 	t.pool.Add(laddr, c)
 	t.pool.Add(raddr, c)
 	go t.readConnection(c, laddr, raddr, handler)
@@ -297,11 +313,7 @@ func (t *TransportWS) CreateConnection(ctx context.Context, laddr Addr, raddr Ad
 		}
 
 		t.log.Debug("New WS connection", "raddr", raddr)
-		c := &WSConnection{
-			Conn:       conn,
-			refcount:   2 + TransportIdleConnection,
-			clientSide: true,
-		}
+		c := t.newConnection(conn, 2+TransportIdleConnection, true)
 		go t.readConnection(c, c.LocalAddr().String(), c.RemoteAddr().String(), handler)
 		return c, nil
 	})
@@ -315,9 +327,12 @@ func (t *TransportWS) CreateConnection(ctx context.Context, laddr Addr, raddr Ad
 type WSConnection struct {
 	net.Conn
 
-	clientSide bool
-	mu         sync.RWMutex
-	refcount   int
+	clientSide   bool
+	readTimeout  time.Duration
+	writeTimeout time.Duration
+
+	mu       sync.RWMutex
+	refcount int
 }
 
 func (c *WSConnection) Ref(i int) int {
@@ -357,6 +372,12 @@ func (c *WSConnection) TryClose() (int, error) {
 }
 
 func (c *WSConnection) Read(b []byte) (n int, err error) {
+	if c.readTimeout > 0 {
+		if err := c.Conn.SetReadDeadline(time.Now().Add(c.readTimeout)); err != nil {
+			return 0, err
+		}
+	}
+
 	state := ws.StateServerSide
 	if c.clientSide {
 		state = ws.StateClientSide
@@ -432,6 +453,12 @@ func (c *WSConnection) Read(b []byte) (n int, err error) {
 }
 
 func (c *WSConnection) Write(b []byte) (n int, err error) {
+	if c.writeTimeout > 0 {
+		if err := c.Conn.SetWriteDeadline(time.Now().Add(c.writeTimeout)); err != nil {
+			return 0, err
+		}
+	}
+
 	if SIPDebug {
 		logSIPWrite("WS", c.Conn.LocalAddr().String(), c.Conn.RemoteAddr().String(), b)
 	}

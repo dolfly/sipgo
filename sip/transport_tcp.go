@@ -20,11 +20,30 @@ type TransportTCP struct {
 	connectionReuse bool
 	readFilter      TransportReadFilter
 
+	// ReadTimeout limits how long a TCP or TLS connection may block waiting
+	// for data. It is copied when the connection is created. A non-positive
+	// value disables the timeout.
+	ReadTimeout time.Duration
+
+	// WriteTimeout limits how long a TCP or TLS connection may block writing
+	// data. It is copied when the connection is created. A non-positive value
+	// disables the timeout.
+	WriteTimeout time.Duration
+
 	pool *connectionPool
 
 	DialerCreate func(laddr net.Addr) net.Dialer
 
 	onConnClose func(conn Connection)
+}
+
+func (t *TransportTCP) newConnection(conn net.Conn, refcount int) *TCPConnection {
+	return &TCPConnection{
+		Conn:         conn,
+		readTimeout:  t.ReadTimeout,
+		writeTimeout: t.WriteTimeout,
+		refcount:     refcount,
+	}
 }
 
 func (t *TransportTCP) init(par *Parser) {
@@ -116,10 +135,7 @@ func (t *TransportTCP) CreateConnection(ctx context.Context, laddr Addr, raddr A
 		// }
 
 		t.log.Debug("New connection", "raddr", raddr)
-		c := &TCPConnection{
-			Conn:     conn,
-			refcount: 2 + TransportIdleConnection, // 1 returning + 1 reading + Idle
-		}
+		c := t.newConnection(conn, 2+TransportIdleConnection) // 1 returning + 1 reading + Idle
 
 		go t.readConnection(c, c.LocalAddr().String(), c.RemoteAddr().String(), handler)
 		return c, nil
@@ -137,10 +153,7 @@ func (t *TransportTCP) initConnection(conn net.Conn, raddr string, handler Messa
 	// conn.SetKeepAlivePeriod(3 * time.Second)
 	laddr := conn.LocalAddr().String()
 	t.log.Debug("New connection", "raddr", raddr)
-	c := &TCPConnection{
-		Conn:     conn,
-		refcount: 1 + TransportIdleConnection,
-	}
+	c := t.newConnection(conn, 1+TransportIdleConnection)
 	t.pool.Add(laddr, c)
 	t.pool.Add(raddr, c)
 	go t.readConnection(c, laddr, raddr, handler)
@@ -248,6 +261,9 @@ func (t *TransportTCP) parseStream(par *ParserStream, data []byte, src string, h
 type TCPConnection struct {
 	net.Conn
 
+	readTimeout  time.Duration
+	writeTimeout time.Duration
+
 	mu       sync.RWMutex
 	refcount int
 }
@@ -289,6 +305,12 @@ func (c *TCPConnection) TryClose() (int, error) {
 }
 
 func (c *TCPConnection) Read(b []byte) (n int, err error) {
+	if c.readTimeout > 0 {
+		if err := c.Conn.SetReadDeadline(time.Now().Add(c.readTimeout)); err != nil {
+			return 0, err
+		}
+	}
+
 	// Some debug hook. TODO move to proper way
 	n, err = c.Conn.Read(b)
 	if SIPDebug {
@@ -298,6 +320,12 @@ func (c *TCPConnection) Read(b []byte) (n int, err error) {
 }
 
 func (c *TCPConnection) Write(b []byte) (n int, err error) {
+	if c.writeTimeout > 0 {
+		if err := c.Conn.SetWriteDeadline(time.Now().Add(c.writeTimeout)); err != nil {
+			return 0, err
+		}
+	}
+
 	// Some debug hook. TODO move to proper way
 	n, err = c.Conn.Write(b)
 	if SIPDebug {
