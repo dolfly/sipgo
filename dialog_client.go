@@ -228,6 +228,9 @@ var (
 	WaitAnswerForceCancelErr = errors.New("Context cancel forced")
 )
 
+// Retry stale digest nonces; see issue #329.
+const maxAuthAttempts = 2
+
 // WaitAnswer waits for success response or returns ErrDialogResponse in case non 2xx
 // Canceling context while waiting 2xx will send Cancel request. It will block until 1xx provisional is not received
 // If Canceling succesfull context.Canceled error is returned
@@ -238,6 +241,7 @@ func (s *DialogClientSession) WaitAnswer(ctx context.Context, opts AnswerOptions
 	tx, inviteRequest := s.inviteTx, s.InviteRequest
 	var r *sip.Response
 	var err error
+	authAttempts := 0
 	for i := 0; ; i++ {
 		if i > 10 {
 			// Preventing some long loops
@@ -274,62 +278,46 @@ func (s *DialogClientSession) WaitAnswer(ctx context.Context, opts AnswerOptions
 			continue
 		}
 
-		if (r.StatusCode == sip.StatusProxyAuthRequired) && opts.Password != "" {
-			h := inviteRequest.GetHeader("Proxy-Authorization")
-			if h == nil {
-				tx.Terminate()
-
-				digopts := digest.Options{
-					Method:   sip.INVITE.String(),
-					URI:      inviteRequest.Recipient.Addr(),
-					Username: opts.Username,
-					Password: opts.Password,
-				}
-
-				// First build this request
-				if err := digestProxyAuthApply(inviteRequest, r, digopts); err != nil {
-					return err
-				}
-
-				// Remove Via from original request and send it through dialog transaction
-				// This keeps transaction within dialog
-				inviteRequest.RemoveHeader("Via")
-				tx, err = s.TransactionRequest(ctx, inviteRequest)
-				if err != nil {
-					return err
-				}
-				s.inviteTx = tx // We need to update this here as we can exit early like on provisional
-				continue
+		var proxyAuth bool
+		var hasChallenge bool
+		switch r.StatusCode {
+		case sip.StatusProxyAuthRequired:
+			if r.GetHeader("Proxy-Authenticate") != nil {
+				proxyAuth = true
+				hasChallenge = true
+			}
+		case sip.StatusUnauthorized:
+			if r.GetHeader("WWW-Authenticate") != nil {
+				hasChallenge = true
 			}
 		}
 
-		if r.StatusCode == sip.StatusUnauthorized && opts.Password != "" {
-			h := inviteRequest.GetHeader("Authorization")
-			if h == nil {
-				tx.Terminate()
-
-				digopts := digest.Options{
-					Method:   sip.INVITE.String(),
-					URI:      inviteRequest.Recipient.Addr(),
-					Username: opts.Username,
-					Password: opts.Password,
-				}
-
-				// First build this request
-				if err := digestAuthApply(inviteRequest, r, digopts); err != nil {
-					return err
-				}
-
-				// Remove Via from original request and send it through dialog transaction
-				// This keeps transaction within dialog
-				inviteRequest.RemoveHeader("Via")
-				tx, err = s.TransactionRequest(ctx, inviteRequest)
-				if err != nil {
-					return err
-				}
-				s.inviteTx = tx // We need to update this here as we can exit early like on provisional
-				continue
+		if opts.Password != "" && hasChallenge && authAttempts < maxAuthAttempts {
+			authAttempts++
+			tx.Terminate()
+			digopts := digest.Options{
+				Method:   sip.INVITE.String(),
+				URI:      inviteRequest.Recipient.Addr(),
+				Username: opts.Username,
+				Password: opts.Password,
 			}
+			var digestErr error
+			if proxyAuth {
+				digestErr = digestProxyAuthApply(inviteRequest, r, digopts)
+			} else {
+				digestErr = digestAuthApply(inviteRequest, r, digopts)
+			}
+			if digestErr != nil {
+				return digestErr
+			}
+
+			inviteRequest.RemoveHeader("Via")
+			tx, err = s.TransactionRequest(ctx, inviteRequest)
+			if err != nil {
+				return err
+			}
+			s.inviteTx = tx
+			continue
 		}
 
 		return &ErrDialogResponse{Res: r}
